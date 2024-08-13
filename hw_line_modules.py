@@ -70,9 +70,9 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
 
 
 class HWLine_Module(nn.Module):
-    def __init__(self, channel_size, hidden_size, output_size, dropout_p=0.1, max_length = 228, D_ch = 16, nWriter = 496):
+    def __init__(self, channel_size, hidden_size, output_size, dropout_p=0.1, max_length = 912, D_ch = 16, nWriter = 496):
         super(HWLine_Module, self).__init__()
-        self.encoder = CNN(channel_size) # CNN-based feature encoder--F
+        self.encoder = CNN() # CNN-based feature encoder--F
         self.decoder_forradical = AttnDecoderRNN(hidden_size, output_size, dropout_p, max_length)    # MARK attention-based decoder--A
         
     def forward(self, image, text_radical, length_radical):
@@ -203,33 +203,61 @@ class AttnDecoderRNN_Cell(nn.Module):
 
 
 class CNN(nn.Module):
-    def __init__(self, channel_size):
+    def __init__(self, flattening='maxpool'):
         super(CNN, self).__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(channel_size, 96, 7, stride=1, padding=3),
-            nn.BatchNorm2d(96),
-            nn.PReLU(),
-            nn.MaxPool2d(2,2),  # 8->4
+        
+        cnn_cfg = [(2, 64), 'M', (4, 128), 'M', (4, 256)]
+        
+        self.k = 1
+        self.flattening = flattening
 
-            nn.Conv2d(96, 128, 3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.PReLU(),
-            nn.MaxPool2d(3,1,1),
+        self.features = nn.ModuleList([nn.Conv2d(4, 32, 7, [1, 1], 3), nn.ReLU()])  # change input image feature dimension
+        in_channels = 32
+        cntm = 0
+        cnt = 1
+        for m in cnn_cfg:
+            if m == 'M':
+                self.features.add_module('mxp' + str(cntm), nn.MaxPool2d(kernel_size=3, stride=1, padding=1))
+                cntm += 1
+            else:
+                for i in range(m[0]):
+                    x = m[1]
+                    self.features.add_module('cnv' + str(cnt), BasicBlock(in_channels, x,))
+                    in_channels = x
+                    cnt += 1
+        
+    def forward(self, x):
+        y = x
+        for i, nn_module in enumerate(self.features):
+            y = nn_module(y)
+        # y = F.max_pool2d(y, [y.size(2), self.k], stride=[y.size(2), 1], padding=[0, self.k//2])
+        
+        return y
+    
 
-            nn.Conv2d(128, 160, 3, stride=1, padding=1),
-            nn.BatchNorm2d(160),
-            nn.PReLU(),
-            nn.MaxPool2d(3,1,1),
+class BasicBlock(nn.Module):
+    expansion = 1
 
-            nn.Conv2d(160, 256, 3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.PReLU(),
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
 
-            nn.Conv2d(256, 256, 3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.PReLU(),
-            nn.MaxPool2d(3,1,1))
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
 
-    def forward(self, input):
-        conv = self.cnn(input)
-        return conv
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion*planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion*planes)
+            )
+        self.relu = nn.ReLU(inplace=False)
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + self.shortcut(x) if len(self.shortcut) > 0 else out + x
+        out = self.relu(out)
+        return out
