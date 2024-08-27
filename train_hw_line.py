@@ -7,13 +7,14 @@ import numpy as np
 
 from hw_line_modules import HWLine_Module, init_net
 from hw_line_dataset import BaseDataset, letters
+from discriminator import GANLoss
 
 CHANNEL_SIZE = 4
 HIDDEN_SIZE = 256
 OUTPUT_SIZE = len(letters) + 3  # +3 for the special tokens
 MAX_LENGTH = 912
 
-BATCH_SIZE = 56
+BATCH_SIZE = 4
 EPOCH = 240
 LR = 0.0001
 BETA1 = 0.5
@@ -39,6 +40,8 @@ def main():
 
     optimizer = Adam(model.parameters(), lr=LR, betas=(BETA1, 0.999))
 
+    criterion = GANLoss().to("cuda")
+
     dataset = BaseDataset(train_image_path, train_label_path)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=dataset.collate_fn_, num_workers=8, pin_memory=True)
     val_dataset = BaseDataset(test_image_path, test_label_path)
@@ -52,13 +55,20 @@ def main():
         for i, data in enumerate(loader):
             images = data["img"].to("cuda")
             lexicon, lexicon_length = data["lexicon"].to("cuda"), data["lexicon_length"].to("cuda")
+            glyphs = data["glyphs"].to("cuda")
+            word_idx = data["word_idx"]
 
             images = vae.encode(images).latent_dist.sample()
             images = images * 0.18215
 
-            loss_forradical = model(images, lexicon, lexicon_length)
+            glyphs = vae.encode(glyphs).latent_dist.sample()
+            glyphs = glyphs * 0.18215
+
+            loss_forradical, pred = model(images, lexicon, lexicon_length, word_idx, glyphs)
+            d_real_loss = criterion(pred, True)
             optimizer.zero_grad()
-            loss_forradical.backward()
+            loss = loss_forradical + d_real_loss
+            loss.backward()
             optimizer.step()
 
             losses.append(loss_forradical.item())

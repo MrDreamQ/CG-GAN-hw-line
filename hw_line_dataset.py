@@ -77,7 +77,7 @@ class BaseDataset(Dataset):
         image = Image.open(img_path).convert('RGB')
         image = self.transforms(image)
         
-        contents = []
+        content = []
         for char in transcr:
             idx = self.letter2index[char]
             con_symbol = self.con_symbols[idx].numpy()
@@ -91,48 +91,134 @@ class BaseDataset(Dataset):
             if len(on) == 0:
                 con_symbol = con_symbol[:, 2:14]
             con_symbol = torch.from_numpy(con_symbol)
-            contents.append(con_symbol)
-        contents = torch.cat(contents, dim=-1)
-        contents = contents.numpy()
-        ratio_w = contents.shape[1]*4
+            content.append(con_symbol)
+        content = torch.cat(content, dim=-1)
+        content = content.numpy()
+        ratio_w = content.shape[1]*4
         if ratio_w <= self.style_len:
-            contents = cv2.resize(contents, (ratio_w, 64))
+            content = cv2.resize(content, (ratio_w, 64))
         else:
-            contents = cv2.resize(contents, (self.style_len, 64))
-        contents = 1. - contents
+            content = cv2.resize(content, (self.style_len, 64))
+        content = 1. - content
         # cv2.imwrite('glyph.png', contents*255)
-        contents = np.stack((contents, contents, contents), axis=2)
-        glyphs = self.transforms(contents)
+        content = np.stack((content, content, content), axis=2)
+        glyph_line = self.transforms(content)
+
+        words = transcr.split(' ')
+        # 获得每个单词首尾字符在字符串中的位置
+        transcr = str(transcr)
+        h_ids, t_ids = [], []
+        for word in words:
+            if word == '':
+                continue
+            h_str = word[0]
+            t_str = word[-1]
+            h_idx = transcr.index(h_str, t_ids[-1] if t_ids else 0)
+            t_idx = h_idx + len(word) - 1
+            h_idx = 0
+            h_ids.append(h_idx)
+            t_ids.append(t_idx)
+        word_idx = [(h, t) for h, t in zip(h_ids, t_ids)]
+        # 将除某个单词外的字符全部变为空格字符
+        word_transcrs = []
+        for h, t in word_idx:
+            word_transcr = ' ' * len(transcr[:h]) + transcr[h:t+1] + ' ' * len(transcr[t + 1:])
+            word_transcrs.append(word_transcr)
+        glyph_words = []
+        for word_transcr in word_transcrs:
+            content = []
+            for char in word_transcr:
+                idx = self.letter2index[char]
+                con_symbol = self.con_symbols[idx].numpy()
+                thr = con_symbol==1.0
+                prof = thr.sum(axis=0)
+                on = np.argwhere(prof)[:,0]
+                if len(on)>0:
+                    left = np.min(on)
+                    right = np.max(on)
+                    con_symbol = con_symbol[:,left-2:right+2]
+                if len(on) == 0:
+                    con_symbol = con_symbol[:, 2:14]
+                con_symbol = torch.from_numpy(con_symbol)
+                content.append(con_symbol)
+            content = torch.cat(content, dim=-1)
+            content = content.numpy()
+            ratio_w = content.shape[1]*4
+            if ratio_w <= self.style_len:
+                content = cv2.resize(content, (ratio_w, 64))
+            else:
+                content = cv2.resize(content, (self.style_len, 64))
+            content = 1. - content
+            content = np.stack((content, content, content), axis=2)
+            content = self.transforms(content)
+            glyph_words.append(content)
 
         return {'img':image,
                 'wid':int(wr_id),
                 'transcr':transcr,
                 'image_name':image_name,
-                'glyph': glyphs}
+                'glyph_line': glyph_line,
+                'word_idx': word_idx,
+                'glyph_words': glyph_words}
 
 
     def collate_fn_(self, batch):
         width = [item['img'].shape[2] for item in batch]
         transcr = [item['transcr'] for item in batch]
         image_name = [item['image_name'] for item in batch]
+        wid = torch.tensor([item['wid'] for item in batch])
+        word_idx = [item['word_idx'] for item in batch]
         
         imgs = torch.full([len(batch), batch[0]['img'].shape[0], batch[0]['img'].shape[1], self.style_len], fill_value=1., dtype=torch.float32)
-        
-        glyphs = torch.ones([len(batch), batch[0]['glyph'].shape[0], batch[0]['glyph'].shape[1], self.style_len], dtype=torch.float32)
+        glyph_line = torch.ones([len(batch), batch[0]['glyph_line'].shape[0], batch[0]['glyph_line'].shape[1], self.style_len], dtype=torch.float32)
+        glyph_words_list = []
         for idx, item in enumerate(batch):
             try:
                 imgs[idx, :, :, 0:item['img'].shape[2]] = item['img']
             except:
                 print('img', item['img'].shape)
 
-            glyphs[idx, :, :, 0:item['glyph'].shape[2]] = item['glyph']
-            
-        wid = torch.tensor([item['wid'] for item in batch])
+            glyph_line[idx, :, :, 0:item['glyph_line'].shape[2]] = item['glyph_line']
+            glyph_words_list += item['glyph_words']
+        
+        glyph_words = torch.ones([len(glyph_words_list), batch[0]['glyph_line'].shape[0], batch[0]['glyph_line'].shape[1], self.style_len], dtype=torch.float32)
+        for i, glyph_word in enumerate(glyph_words_list):
+            glyph_words[i, :, :, 0:glyph_word.shape[2]] = glyph_word
+        glyphs = torch.cat([glyph_line, glyph_words], dim=0)
         lexicon, lexicon_length = self.encode(transcr)
 
-        return {'img':imgs, 'wid':wid, 'transcr': transcr, 'image_name':image_name, 'glyph': glyphs, 
-                'lexicon': lexicon, 'lexicon_length': lexicon_length}
+        return {'img':imgs, 'wid':wid, 'transcr': transcr, 'image_name':image_name, 
+                'lexicon': lexicon, 'lexicon_length': lexicon_length,
+                'glyph_line': glyph_line, 'word_idx': word_idx, 'glyph_words': glyph_words, 'glyphs': glyphs}
     
+
+    def get_glyph(self, text, w_ratio):
+        content = []
+        for char in text:
+            idx = self.letter2index[char]
+            con_symbol = self.con_symbols[idx].numpy()
+            thr = con_symbol==1.0
+            prof = thr.sum(axis=0)
+            on = np.argwhere(prof)[:,0]
+            if len(on)>0:
+                left = np.min(on)
+                right = np.max(on)
+                con_symbol = con_symbol[:,left-2:right+2]
+            if len(on) == 0:
+                con_symbol = con_symbol[:, 2:14]
+            con_symbol = torch.from_numpy(con_symbol)
+            content.append(con_symbol)
+        content = torch.cat(content, dim=-1)
+        content = content.numpy()
+        ratio_w = round(w_ratio * self.style_len)
+        content = cv2.resize(content, (ratio_w, 64))
+        content = 1. - content
+        content = np.stack((content, content, content), axis=2)
+        content = self.transforms(content)
+        glyph = torch.ones((3, 64, self.style_len))
+        glyph[:,:, :content.shape[2]] = content
+
+        return glyph
 
     def encode(self, text):
         """ convert a batch of text-label into text-index.

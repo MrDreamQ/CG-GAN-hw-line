@@ -17,6 +17,7 @@ from torch.nn.parameter import Parameter
 from torchvision.models.vgg import vgg19
 from torch.autograd import Variable
 
+from discriminator import Discriminator
 
 def init_weights(net, init_type='normal', init_gain=0.02):
     """Initialize network weights.
@@ -73,14 +74,17 @@ class HWLine_Module(nn.Module):
     def __init__(self, channel_size, hidden_size, output_size, dropout_p=0.1, max_length = 912, D_ch = 16, nWriter = 496):
         super(HWLine_Module, self).__init__()
         self.encoder = CNN() # CNN-based feature encoder--F
-        self.decoder_forradical = AttnDecoderRNN(hidden_size, output_size, dropout_p, max_length)    # MARK attention-based decoder--A
+        self.decoder_forradical = AttnDecoderRNN(hidden_size, output_size, dropout_p, max_length)    # attention-based decoder--A
+        self.content_disriminator = Discriminator() # content discriminator--D
         
-    def forward(self, image, text_radical, length_radical):
+    def forward(self, image, text_radical, length_radical, word_idx, glyphs):
         encode = self.encoder(image)    
         b, c, _, _ = encode.size() #batch,256
-        loss_forradical, new_encode = self.decoder_forradical(encode,image,text_radical,length_radical)   # 结构保持损失Lstrc | 部首级注意力特征
+        loss_forradical, new_encode = self.decoder_forradical(encode,image,text_radical,length_radical, word_idx)   # 结构保持损失Lstrc | 部首级注意力特征
+        glyphs = self.encoder(glyphs)
+        pred = self.content_disriminator(new_encode, glyphs) # 部首级注意力特征与部首级文本的对抗损失Ladv
 
-        return loss_forradical
+        return loss_forradical, pred
     
     def predict(self, image, text_radical):
         encode = self.encoder(image)    
@@ -101,14 +105,22 @@ class AttnDecoderRNN(nn.Module):
         self.resize = T.Resize(size = (128,128))
    
     def cal(self,image,alpha_map):
-        alpha_map = alpha_map.cpu().detach().numpy().reshape(8,8)
-        alpha_map =((alpha_map /alpha_map.max())*255).astype(np.uint8)
-        alpha_map[alpha_map>0]=1
-        alpha_map = cv2.resize(alpha_map,(image.shape[3],image.shape[2]))
-        alpha_map_tensor = torch.from_numpy(alpha_map).expand_as(image[0]).cuda()
+        alpha_map_weight = ((alpha_map-alpha_map.min())/(alpha_map.max()-alpha_map.min())).reshape(8,114)
+        bool_map = alpha_map_weight.detach().cpu().numpy() > 0.2
+        bool_map = bool_map.sum(axis=0)
+        on = np.argwhere(bool_map)[:,0]
+        left, right = 0, 114
+        if len(on) > 0:
+            right = np.max(on)
+        alpha_map_weight[:, left:right] = 1
+        alpha_map_weight =(alpha_map_weight*255).detach().cpu().numpy().astype(np.uint8)
+        alpha_map_weight = cv2.resize(alpha_map_weight,(image.shape[3],image.shape[2]), )
+        alpha_map_tensor = torch.from_numpy(alpha_map_weight).expand_as(image[0]).cuda()
+        # alpha_map_tensor = torch.from_numpy(alpha_map_weight).unsqueeze(0).repeat(3,1,1).cuda()
+        alpha_map_tensor = alpha_map_tensor[0:3]
         return alpha_map_tensor
 
-    def forward(self,encode,image,text,text_length):
+    def forward(self,encode,image,text,text_length, word_idx):
         batch_size = image.shape[0]
         decoder_input = text[:,0]
         decoder_hidden = torch.autograd.Variable(torch.zeros(1, batch_size, self.hidden_size)).cuda()        
@@ -132,18 +144,31 @@ class AttnDecoderRNN(nn.Module):
                 decoder_input = ni
         
         _,c,h,w=encode.shape
-        num_labels = text_length.data.sum()
+        num_labels = 0
+        for word_id in word_idx:
+            num_labels += len(word_id)
         new_encode = torch.zeros(num_labels,c,h,w).type_as(encode.data)
         start = 0
-        for i,length in enumerate(text_length.data):
+        for i,length in enumerate(text_length.data):    # sample batch
             #import pdb;pdb.set_trace()               
-            attention_maps = attention_map_list[0:length]
-            for j,alpha_map in enumerate(attention_maps):
-                #import pdb;pdb.set_trace()
-                alpha_map_weight = ((alpha_map[i]-alpha_map[i].min())/(alpha_map[i].max()-alpha_map[i].min())).reshape(1,h,w)
+            attention_maps = attention_map_list[0:length]   # a sample time steps of attention maps
+            for j, (h_idx, t_idx) in enumerate(word_idx[i]): # time step
+                alpha_map = torch.zeros_like(attention_maps[0][0])
+                # MARK 有关attention mask的trick
+                for k in range(h_idx, t_idx+1):
+                    alpha_map += attention_maps[k][i]
+                alpha_map_weight = ((alpha_map-alpha_map.min())/(alpha_map.max()-alpha_map.min())).reshape(1,h,w)
                 encode_weight = encode[i]*alpha_map_weight
                 new_encode[start] = encode_weight
                 start +=1
+        
+            # for j,alpha_map in enumerate(attention_maps): # time step
+            #     alpha_map_weight = ((alpha_map[i]-alpha_map[i].min())/(alpha_map[i].max()-alpha_map[i].min())).reshape(1,h,w)
+            #     encode_weight = encode[i]*alpha_map_weight
+            #     new_encode[start] = encode_weight
+            #     start +=1
+            
+        new_encode = torch.cat([encode, new_encode], dim=0)
         
         return loss, new_encode
     
@@ -157,7 +182,7 @@ class AttnDecoderRNN(nn.Module):
             decoder_output, decoder_hidden, decoder_attention = self.attention_cell(decoder_input, decoder_hidden, encode)
             attention_map_list.append(decoder_attention)
             topv, topi = decoder_output.data.topk(1)
-            ni = topi.squeeze()
+            ni = topi.squeeze(dim=-1)
             decoder_input = ni
             text[:,di] = ni
 
